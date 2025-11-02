@@ -1,10 +1,13 @@
 import os
 import re
+import json
 import shutil
 import zipfile
 import subprocess
 from abc import ABC, abstractmethod
 from typing import List
+from typing import List, Dict, Any
+import hashlib
 import click
 
 CALIBRE_CLI = "ebook-convert"
@@ -151,6 +154,8 @@ class TranslationFlow:
         self.temp_dir = "temp_epub_data"
         self.original_temp_dir = "temp_epub_data"
         self.content_files: List[str] = []
+        self.track: List[Dict[str, Any]] = []
+        self.track_filename = ""
 
     def extract(self) -> 'TranslationFlow':
         """Etapa 1: Extrai o EPUB."""
@@ -159,6 +164,47 @@ class TranslationFlow:
         extractor.extract()
         self.content_files = extractor.get_content_files()
         return self
+    
+    def setTrack(self) -> 'TranslationFlow':
+        print("--- Fazendo track ---")
+        
+        epub_hash = hashlib.md5(self.epub_path.encode('utf-8')).hexdigest()
+        self.track_filename = f"{epub_hash}.json"
+        
+        if os.path.exists(self.track_filename):
+            print(f"Arquivo de track existente: {self.track_filename}. Carregando...")
+            with open(self.track_filename, 'r', encoding='utf-8') as f:
+                self.track = json.load(f)
+            return self
+
+        print("Arquivo de track não encontrado. Gerando novo track...")
+        self.track = []
+        for file in self.content_files:
+            self.track.append({
+                "file": file, 
+                "relative": "", 
+                "output": "",   
+                "translated": False
+            })
+
+        try:
+            with open(self.track_filename, 'w', encoding='utf-8') as f:
+                json.dump(self.track, f, indent=4)
+            print(f"Novo arquivo de track salvo: {self.track_filename}")
+        except Exception as e:
+            print(f"Erro ao salvar arquivo de track: {e}")
+
+        return self
+    
+    def updateTrackFile(self) -> 'TranslationFlow' :
+        try:
+            with open(self.track_filename, 'w', encoding='utf-8') as f:
+                json.dump(self.track, f, indent=4)
+            print(f"Arquivo de track atualizado: {self.track_filename}")
+        except Exception as e:
+            print(f"Erro ao atualizar arquivo de track: {e}")
+        return self
+    
 
     def translate_all(self, source_lang: str, target_lang: str) -> 'TranslationFlow':
         """Etapa 2: Traduz todos os arquivos de conteúdo."""
@@ -184,6 +230,47 @@ class TranslationFlow:
             
         self.temp_dir = temp_translated_dir 
         return self
+    
+    def has_chinese(text: str) -> bool:
+        """Verifica se o texto contém caracteres chineses (simplificado ou tradicional)."""
+        return bool(re.search(r'[\u4e00-\u9fff]', text))
+
+    def translate_all_from_track(self, source_lang: str, target_lang: str) -> 'TranslationFlow':
+        """Etapa 2: Traduz todos os arquivos de conteúdo, 
+        verificando se arquivos marcados como traduzidos ainda contêm chinês."""
+        print("\n--- INICIANDO TRADUÇÃO ---")
+        if not self.track:
+            print("Nenhum arquivo de conteúdo encontrado para tradução.")
+            return self
+
+        temp_translated_dir = f"{self.original_temp_dir}_translated"
+        if not os.path.exists(temp_translated_dir):
+            shutil.copytree(self.temp_dir, temp_translated_dir)
+
+        translated_files = []   
+
+        for file in self.track:
+            file_path = file.get("file")
+            is_translated = file.get("translated", False)   
+
+            if is_translated:
+                print(f"Arquivo {file_path} já traduzido. Pulando...")
+                continue
+
+            relative_path = os.path.relpath(file_path, self.temp_dir)
+            output_path = os.path.join(temp_translated_dir, relative_path)
+            file["relative"] = relative_path
+            file["output"] = output_path
+
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+            self.translator.translate_file(file_path, output_path, source_lang, target_lang)
+            translated_files.append(output_path)
+            file["translated"] = True
+            self.updateTrackFile()
+
+        self.temp_dir = temp_translated_dir 
+        return self
 
     def package(self) -> 'TranslationFlow':
         """Etapa 3: Unifica os arquivos traduzidos em um novo EPUB."""
@@ -198,6 +285,10 @@ class TranslationFlow:
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
             print(f"Diretório temporário removido: {self.temp_dir}")
+
+        if os.path.exists(self.track_filename):
+            os.remove(self.track_filename)
+            print(f"Arquivo de track removido: {self.track_filename}")
         
         if self.original_temp_dir != self.temp_dir and os.path.exists(self.original_temp_dir):
             shutil.rmtree(self.original_temp_dir)
@@ -210,7 +301,8 @@ class TranslationFlow:
 @click.option('--source-lang', '-s', required=True, help='Linguagem de origem (ex: en).')
 @click.option('--target-lang', '-t', required=True, help='Linguagem de destino (ex: pt-br).')
 @click.option('--api-key', '-k', required=True, help='Chave da API do Gemini. Será configurada temporariamente na variável de ambiente.')
-def cli_main(input_path: str, output_path: str, source_lang: str, target_lang: str, api_key: str):
+@click.option('--track', '-r', is_flag=True, default=False,required=False, help='Mantem rastreio de onde parou')
+def cli_main(input_path: str, output_path: str, source_lang: str, target_lang: str, api_key: str, track: bool):
     """
     Ferramenta para tradução de EPUBs usando o Gemini CLI.
     """
@@ -231,7 +323,11 @@ def cli_main(input_path: str, output_path: str, source_lang: str, target_lang: s
             translator=translator_service
         )
         
-        flow.extract().translate_all(source_lang=source_lang, target_lang=target_lang).package()
+        if track:
+            flow.extract().setTrack().translate_all_from_track(source_lang=source_lang, target_lang=target_lang).package()
+            flow.cleanup()
+        else:
+            flow.extract().translate_all(source_lang=source_lang, target_lang=target_lang).package()
         
         print("\nFLUXO CONCLUÍDO COM SUCESSO.")
         
@@ -243,7 +339,7 @@ def cli_main(input_path: str, output_path: str, source_lang: str, target_lang: s
         print(f"\nERRO CRÍTICO NO FLUXO: {e}")
         
     finally:
-        if flow:
+        if flow and track == False:
             flow.cleanup()
         unset_gemini_api_key()
         pass

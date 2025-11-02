@@ -1,0 +1,8 @@
+.*
+!.gitignore
+*.epub
+temp_*
+venv
+*.py
+!main.py
+*.json
