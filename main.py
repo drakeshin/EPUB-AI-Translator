@@ -4,6 +4,7 @@ import json
 import shutil
 import zipfile
 import subprocess
+import time
 from abc import ABC, abstractmethod
 from typing import List
 from typing import List, Dict, Any
@@ -55,6 +56,8 @@ class GeminiCliTranslator(TranslatorBase):
         
         print(f"  > Executando: Gemini CLI para traduzir {input_path}...")
 
+        total_lines_input_path = self._check_content_lines_from_path(input_path)
+
         try:
             result = subprocess.run(
                 command, 
@@ -66,12 +69,19 @@ class GeminiCliTranslator(TranslatorBase):
             )
             
             content_translated = result.stdout
-            
+            content_translated = re.sub(r"^(?:```(?:html|xhtml|xml|opf|ncx)\n)", "", content_translated, flags=re.IGNORECASE)
+            content_translated = re.sub(r"(\n)?```(\n)?$", "", content_translated)
+
             if not content_translated:
                 raise ValueError("O Gemini CLI não retornou nenhum conteúdo (stdout vazio).")
 
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(content_translated)
+
+            total_lines_translated = self._check_content_lines_from_path(output_path)
+
+            if total_lines_translated < round((total_lines_input_path * 0.90)):
+                raise ValueError("Arquivo traduzido de forma incorreta pelo Gemini CLI.")
 
             print(f"  > Arquivo traduzido salvo em: {output_path}")
 
@@ -86,6 +96,24 @@ class GeminiCliTranslator(TranslatorBase):
         except Exception as e:
             print(f"  > ERRO inesperado na tradução: {e}")
             raise
+    
+    def _check_content_lines_from_path(self, content):
+        try:
+            with open(content, 'r', encoding='utf-8') as arquivo:
+                conteudo = arquivo.read()
+        except FileNotFoundError:
+            print(f"Erro: O arquivo '{content}' não foi encontrado.")
+            conteudo = 0
+
+        if conteudo is not None:
+            quantidade_linhas = len(conteudo.splitlines())
+            return quantidade_linhas
+        else:
+            return 0
+    
+    def _check_content_lines(self, content):
+        quantidade_linhas = len(content.splitlines())
+        return quantidade_linhas
 
     def translate_file(self, input_path: str, output_path: str, source_lang: str, target_lang: str) -> None:
         """Executa a tradução no arquivo."""
@@ -115,7 +143,7 @@ class EpubExtractor:
         content_files = []
         for root, _, files in os.walk(self.output_dir):
             for file in files:
-                if file.endswith(('.html', '.xhtml', '.htm')):
+                if file.endswith(('.html', '.xhtml', '.htm', '.ncx', '.opf')):
                     content_files.append(os.path.join(root, file))
         return content_files
 
@@ -151,12 +179,29 @@ class TranslationFlow:
         self.epub_path = epub_path
         self.output_epub_path = output_epub_path
         self.translator = translator
-        self.temp_dir = "temp_epub_data"
-        self.original_temp_dir = "temp_epub_data"
+        # Modificado para garantir que o temp_dir seja único por execução/livro
+        epub_hash_short = hashlib.md5(epub_path.encode('utf-8')).hexdigest()[:10]
+        self.temp_dir = f"temp_epub_data_{epub_hash_short}"
+        self.original_temp_dir = f"temp_epub_data_{epub_hash_short}"
         self.content_files: List[str] = []
         self.track: List[Dict[str, Any]] = []
         self.track_filename = ""
-
+        self.can_retry = False
+        self.retry_limit = 1
+        self.retry_time = 10
+    
+    def setRetry(self, can:bool) -> 'TranslationFlow':
+        self.can_retry = can
+        return self
+    
+    def setRetryLimit(self, limit:int) -> 'TranslationFlow':
+        self.retry_limit = limit
+        return self
+    
+    def setRetryTime(self, time:int) -> 'TranslationFlow':
+        self.retry_time = time
+        return self
+    
     def extract(self) -> 'TranslationFlow':
         """Etapa 1: Extrai o EPUB."""
         print("--- INICIANDO EXTRAÇÃO ---")
@@ -168,6 +213,7 @@ class TranslationFlow:
     def setTrack(self) -> 'TranslationFlow':
         print("--- Fazendo track ---")
         
+        # O HASH DO EPUB_PATH JÁ GARANTE UM TRACK POR ARQUIVO
         epub_hash = hashlib.md5(self.epub_path.encode('utf-8')).hexdigest()
         self.track_filename = f"{epub_hash}.json"
         
@@ -175,6 +221,26 @@ class TranslationFlow:
             print(f"Arquivo de track existente: {self.track_filename}. Carregando...")
             with open(self.track_filename, 'r', encoding='utf-8') as f:
                 self.track = json.load(f)
+            # Recarregar os caminhos de arquivo baseados no temp_dir atual
+            # (caso o temp_dir original tenha sido limpo)
+            # Isto é uma salvaguarda:
+            new_content_files = []
+            for root, _, files in os.walk(self.original_temp_dir):
+                for file in files:
+                    if file.endswith(('.html', '.xhtml', '.htm', '.ncx', '.opf')):
+                        new_content_files.append(os.path.join(root, file))
+
+            if len(new_content_files) != len(self.track):
+                 print("Inconsistência detectada. Gerando novo track...")
+                 # Força a regeneração se os arquivos extraídos não baterem com o track
+                 os.remove(self.track_filename)
+                 return self.setTrack() # Recomeça a função
+            
+            # Atualiza os caminhos no track carregado para refletir o temp_dir atual
+            for i, track_item in enumerate(self.track):
+                # Assume que a ordem está preservada
+                track_item["file"] = new_content_files[i]
+
             return self
 
         print("Arquivo de track não encontrado. Gerando novo track...")
@@ -205,6 +271,25 @@ class TranslationFlow:
             print(f"Erro ao atualizar arquivo de track: {e}")
         return self
     
+    def isTrackComplete(self):
+        try:
+            track_to_verify = None
+            if os.path.exists(self.track_filename):
+                print(f"Verificando se track está completo. Carregando {self.track_filename}...")
+                with open(self.track_filename, 'r', encoding='utf-8') as f:
+                    track_to_verify = json.load(f)
+                for track in track_to_verify:
+                    is_already_translated = track.get("translated", False)
+                    if not is_already_translated:
+                        print(f"Arquivo de track {self.track_filename} incompleto!")
+                        return False
+                print(f"Arquivo de track {self.track_filename} completo!")
+                return True
+            print(f"Arquivo de track {self.track_filename} não encontrado!")
+            return False
+        except Exception as e:
+            print(f"Erro ao verificar arquivo de track: {e}")
+            return False
 
     def translate_all(self, source_lang: str, target_lang: str) -> 'TranslationFlow':
         """Etapa 2: Traduz todos os arquivos de conteúdo."""
@@ -222,12 +307,20 @@ class TranslationFlow:
         for file_path in self.content_files:
             relative_path = os.path.relpath(file_path, self.temp_dir)
             output_path = os.path.join(temp_translated_dir, relative_path)
-            
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             
-            self.translator.translate_file(file_path, output_path, source_lang, target_lang)
-            translated_files.append(output_path)
-            
+            for timel in range(self.retry_limit):
+                try:
+                    self.translator.translate_file(file_path, output_path, source_lang, target_lang)
+                    translated_files.append(output_path)
+                    break
+                except:
+                    if self.can_retry:
+                        print(f"Erro na tradução, tentando novamente em {self.retry_time}m")
+                        time.sleep(self.retry_time)
+                        continue
+                    raise ValueError("Arquivo não foi devidamente traduzido.")
+                
         self.temp_dir = temp_translated_dir 
         return self
     
@@ -264,9 +357,19 @@ class TranslationFlow:
 
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-            self.translator.translate_file(file_path, output_path, source_lang, target_lang)
-            translated_files.append(output_path)
-            file["translated"] = True
+            for timelimit in range(self.retry_limit):
+                try:
+                    self.translator.translate_file(file_path, output_path, source_lang, target_lang)
+                    translated_files.append(output_path)
+                    file["translated"] = True
+                    break
+                except:
+                    if self.can_retry:
+                        print(f"Erro na tradução, tentando novamente em {self.retry_time}m")
+                        time.sleep((self.retry_time*60))
+                        continue
+                    raise ValueError("Arquivo não foi devidamente traduzido.")
+
             self.updateTrackFile()
 
         self.temp_dir = temp_translated_dir 
@@ -275,6 +378,9 @@ class TranslationFlow:
     def package(self) -> 'TranslationFlow':
         """Etapa 3: Unifica os arquivos traduzidos em um novo EPUB."""
         print("\n--- INICIANDO EMPACOTAMENTO ---")
+        if not self.isTrackComplete():
+            print("Arquivo de track incompleto, impossível realizar empacotamento!")
+            raise Exception("Arquivo de track incompleto, impossível realizar empacotamento!")
         packager = EpubPackager(self.temp_dir, self.output_epub_path)
         packager.package()
         return self
@@ -296,13 +402,16 @@ class TranslationFlow:
 
 
 @click.command()
-@click.option('--input-path', '-i', required=True, type=click.Path(exists=True), help='Caminho para o arquivo EPUB de entrada.')
-@click.option('--output-path', '-o', required=True, type=click.Path(), help='Caminho para o arquivo EPUB de saída traduzido.')
+@click.option('--input-path', '-i', required=True, type=click.Path(exists=True), help='Caminho para o arquivo EPUB de entrada ou diretório contendo EPUBs.')
+@click.option('--output-path', '-o', required=False, default=None, type=click.Path(), help='Caminho para o arquivo EPUB de saída traduzido. Ignorado se --input-path for um diretório.')
 @click.option('--source-lang', '-s', required=True, help='Linguagem de origem (ex: en).')
 @click.option('--target-lang', '-t', required=True, help='Linguagem de destino (ex: pt-br).')
 @click.option('--api-key', '-k', required=True, help='Chave da API do Gemini. Será configurada temporariamente na variável de ambiente.')
 @click.option('--track', '-r', is_flag=True, default=False,required=False, help='Mantem rastreio de onde parou')
-def cli_main(input_path: str, output_path: str, source_lang: str, target_lang: str, api_key: str, track: bool):
+@click.option('--retry', '-e', is_flag=True, default=False,required=False, help='Em caso de erro na tradução, será feito retry')
+@click.option('--retry-limit', '-l', required=False, default=10, help='Limite de retry')
+@click.option('--retry-time', '-u', required=False, default=10, help='Tempo de espera entre cada retry em minutos')
+def cli_main(input_path: str, output_path: str, source_lang: str, target_lang: str, api_key: str, track: bool, retry:bool, retry_limit: int, retry_time: int):
     """
     Ferramenta para tradução de EPUBs usando o Gemini CLI.
     """
@@ -310,36 +419,114 @@ def cli_main(input_path: str, output_path: str, source_lang: str, target_lang: s
     flow = None
     try:
         set_gemini_api_key(api_key)
+        translator_service = GeminiCliTranslator() # Definido uma vez
         
-        print(f"\n--- INICIANDO FLUXO DE TRADUÇÃO ---")
-        print(f"De: {input_path} ({source_lang})")
-        print(f"Para: {output_path} ({target_lang})")
+        # --- MODO DIRETÓRIO ---
+        if os.path.isdir(input_path):
+            print(f"\n--- INICIANDO FLUXO DE TRADUÇÃO (MODO DIRETÓRIO) ---")
+            print(f"Diretório de entrada: {input_path}")
+            print(f"Linguagem de destino: {target_lang.upper()}")
 
-        translator_service = GeminiCliTranslator() 
+            # Obtém todos os arquivos para verificação de existência
+            all_files_set = set(os.listdir(input_path))
+            
+            # Define o prefixo de saída esperado
+            prefix = f"[TRANSLATED][{target_lang.upper()}]"
+            
+            epub_files = [] # Lista final de arquivos a processar
+
+            for filename in all_files_set:
+                # 1. Encontra apenas arquivos .epub originais
+                if filename.lower().endswith('.epub') and not filename.startswith('[TRANSLATED]'):
+                    
+                    # 2. Constrói o nome do arquivo de saída esperado
+                    expected_output_name = f"{prefix}{filename}"
+                    
+                    # 3. VERIFICAÇÃO CRUCIAL: Processa o original APENAS SE a saída NÃO existir
+                    if expected_output_name not in all_files_set:
+                        epub_files.append(filename)
+            
+            if not epub_files:
+                print("Nenhum arquivo .epub novo (que precise de tradução) foi encontrado no diretório.")
+                return # Sai da função cli_main
+
+            print(f"Arquivos EPUB encontrados para tradução: {len(epub_files)}")
+            
+            for i, epub_file in enumerate(epub_files):
+                current_input = os.path.join(input_path, epub_file)
+                
+                # Gera o nome do arquivo de saída conforme requisito
+                output_filename = f"[TRANSLATED][{target_lang.upper()}]{epub_file}"
+                current_output = os.path.join(input_path, output_filename)
+                
+                print(f"\n--- Processando Arquivo {i+1}/{len(epub_files)}: {epub_file} ---")
+                
+                flow = None # Reseta o flow para cada iteração
+                try:
+                    flow = TranslationFlow(
+                        epub_path=current_input,
+                        output_epub_path=current_output,
+                        translator=translator_service
+                    )
+                    
+                    if track:
+                        # O cleanup (incluindo remoção do track) é chamado no sucesso
+                        flow.setRetry(retry).setRetryLimit(retry_limit).setRetryTime(retry_time).extract().setTrack().translate_all_from_track(source_lang=source_lang, target_lang=target_lang).package()
+                        flow.cleanup()
+                    else:
+                        flow.extract().translate_all(source_lang=source_lang, target_lang=target_lang).package()
+                        flow.cleanup() # Limpa os temps (sem track)
+                    
+                    print(f"--- Arquivo {epub_file} concluído ---")
+                
+                except Exception as e:
+                    print(f"\nERRO CRÍTICO NO FLUXO (Arquivo: {epub_file}): {e}")
+                    print(f"Continuando para o próximo arquivo...")
+                    # Limpeza parcial se falhar (sem track)
+                    if flow and track == False:
+                        flow.cleanup()
+                    # Se for com track, NÃO limpa, para preservar o .json
+                    if flow and track == True and hasattr(flow, 'track_filename') and flow.track_filename:
+                         print(f"Preservando arquivo de track: {flow.track_filename}")
+
+            print("\nFLUXO (MODO DIRETÓRIO) CONCLUÍDO.")
+
+        # --- MODO ARQUIVO ÚNICO ---
+        elif os.path.isfile(input_path):
+            
+            # Validação do output_path obrigatório para modo arquivo
+            if output_path is None:
+                raise click.UsageError("O --output-path ('-o') é obrigatório quando --input-path é um arquivo.")
+
+            print(f"\n--- INICIANDO FLUXO DE TRADUÇÃO (MODO ARQUIVO ÚNICO) ---")
+            print(f"De: {input_path} ({source_lang})")
+            print(f"Para: {output_path} ({target_lang})")
+            
+            flow = TranslationFlow(
+                epub_path=input_path,
+                output_epub_path=output_path,
+                translator=translator_service
+            )
+            
+            if track:
+                flow.setRetry(retry).setRetryLimit(retry_limit).setRetryTime(retry_time).extract().setTrack().translate_all_from_track(source_lang=source_lang, target_lang=target_lang).package()
+                flow.cleanup() # Limpa o track file e temps
+            else:
+                flow.extract().translate_all(source_lang=source_lang, target_lang=target_lang).package()
+                # A limpeza de track=False será pega pelo 'finally'
+            
+            print("\nFLUXO (MODO ARQUIVO ÚNICO) CONCLUÍDO COM SUCESSO.")
         
-        flow = TranslationFlow(
-            epub_path=input_path,
-            output_epub_path=output_path,
-            translator=translator_service
-        )
-        
-        if track:
-            flow.extract().setTrack().translate_all_from_track(source_lang=source_lang, target_lang=target_lang).package()
-            flow.cleanup()
         else:
-            flow.extract().translate_all(source_lang=source_lang, target_lang=target_lang).package()
-        
-        print("\nFLUXO CONCLUÍDO COM SUCESSO.")
-        
-    except FileNotFoundError as e:
-        print(f"\nERRO: Um arquivo necessário não foi encontrado. {e}")
-    except subprocess.CalledProcessError as e:
-        print(f"\nERRO DE PROCESSO: Falha na execução de um comando externo (Calibre ou Gemini CLI). {e}")
-    except Exception as e:
+             raise FileNotFoundError(f"O caminho de entrada não é um arquivo ou diretório válido: {input_path}")
+
+    except (FileNotFoundError, subprocess.CalledProcessError, click.UsageError, Exception) as e:
+        # Captura erros de setup (API key), erros de validação do Click, ou falhas no modo arquivo único
         print(f"\nERRO CRÍTICO NO FLUXO: {e}")
         
     finally:
-        if flow and track == False:
+        if os.path.isfile(input_path) and flow and track == False:
+            print("Executando limpeza final (modo arquivo, sem track)...")
             flow.cleanup()
         unset_gemini_api_key()
         pass
