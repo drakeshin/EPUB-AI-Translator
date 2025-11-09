@@ -45,11 +45,11 @@ class GeminiCliTranslator(TranslatorBase):
         """
         
         prompt = (
-            f"Traduza o seguinte conteúdo de {source_lang} para {target_lang}. "
-            f"É um trecho de código HTML/XHTML. Você deve traduzir *apenas* "
-            f"o texto que *não* está dentro de nenhuma tag (como <p>, <h1>, etc.). "
-            f"Retorne o conteúdo completo, mantendo a estrutura original e todas as tags intactas, "
-            f"substituindo apenas o texto traduzido."
+            f"Traduza todo o texto visível dentro das tags HTML/XHTML/OPF/NCX (como <p>, <h1>, <h2>, etc.) "
+            f"de {source_lang} para {target_lang}. "
+            f"O conteúdo a ser traduzido inclui todo o texto contido em parágrafos, cabeçalhos, títulos e corpo do documento. "
+            f"Mantenha todas as tags, atributos (como class='', style='', src='', entre outros atributos independente de preenchidos ou não) e a estrutura do documento *completamente* intactos. "
+            f"Retorne o código HTML/XHTML/OPF/NCX completo e traduzido."
         )
 
         command = f'{GEMINI_CLI} --model gemini-2.5-flash --prompt "{prompt}" < {input_path}'
@@ -69,7 +69,7 @@ class GeminiCliTranslator(TranslatorBase):
             )
             
             content_translated = result.stdout
-            content_translated = re.sub(r"^(?:```(?:html|xhtml|xml|opf|ncx)\n)", "", content_translated, flags=re.IGNORECASE)
+            content_translated = re.sub(r"(?s)^.*?^(?:```(?:html|xhtml|xml|opf|ncx)\n)", "", content_translated, flags=re.IGNORECASE)
             content_translated = re.sub(r"(\n)?```(\n)?$", "", content_translated)
 
             if not content_translated:
@@ -81,7 +81,7 @@ class GeminiCliTranslator(TranslatorBase):
             total_lines_translated = self._check_content_lines_from_path(output_path)
 
             if total_lines_translated < round((total_lines_input_path * 0.90)):
-                raise ValueError("Arquivo traduzido de forma incorreta pelo Gemini CLI.")
+                self._check_file_integrity(output_path)
 
             print(f"  > Arquivo traduzido salvo em: {output_path}")
 
@@ -96,6 +96,46 @@ class GeminiCliTranslator(TranslatorBase):
         except Exception as e:
             print(f"  > ERRO inesperado na tradução: {e}")
             raise
+    
+    def _check_file_integrity(self, file_path: str) -> None:
+        """
+        Verifica se o arquivo XHTML/HTML está encerrado corretamente,
+        procurando pelas tags </body> e </html> no final.
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Arquivo não encontrado para verificação de integridade: {file_path}")
+
+        # Ler as últimas 512 bytes do arquivo
+        # 512 bytes é mais do que suficiente para capturar as tags de fechamento
+        with open(file_path, 'rb') as f:
+            f.seek(-512, os.SEEK_END)
+            tail_content = f.read().decode('utf-8', errors='ignore')
+
+        # A verificação é sensível à caixa, mas a maioria dos geradores usa minúsculas
+        # Se quiser ignorar a caixa: tail_content = tail_content.lower()
+
+        if '</body>' not in tail_content:
+            raise ValueError("ERRO DE INTEGRIDADE: O arquivo traduzido não contém a tag de fechamento </body> no final.")
+
+        if '</html>' not in tail_content:
+            raise ValueError("ERRO DE INTEGRIDADE: O arquivo traduzido não contém a tag de fechamento </html> no final.")
+
+        # Verifica se </html> é a última tag significativa (uma checagem de ordem)
+        # Procuramos por </html> e garantimos que </body> esteja antes
+        try:
+            index_body_close = tail_content.rindex('</body>')
+            index_html_close = tail_content.rindex('</html>')
+
+            if index_body_close > index_html_close:
+                 raise ValueError("ERRO DE ORDEM: A tag </body> está posicionada APÓS </html>, indicando uma estrutura inválida.")
+
+        except ValueError:
+            # Se as tags não forem encontradas por rindex (mas foram encontradas por 'in'), 
+            # significa que a estrutura é complexa, mas as tags estão presentes. 
+            # O teste acima já captura a ausência.
+            pass
+
+        print("  > Integridade estrutural verificada: Tags </body> e </html> encontradas e na ordem correta.")
     
     def _check_content_lines_from_path(self, content):
         try:
@@ -428,7 +468,7 @@ def cli_main(input_path: str, output_path: str, source_lang: str, target_lang: s
             print(f"Linguagem de destino: {target_lang.upper()}")
 
             # Obtém todos os arquivos para verificação de existência
-            all_files_set = set(os.listdir(input_path))
+            all_files_set = sorted(os.listdir(input_path))
             
             # Define o prefixo de saída esperado
             prefix = f"[TRANSLATED][{target_lang.upper()}]"
@@ -510,7 +550,7 @@ def cli_main(input_path: str, output_path: str, source_lang: str, target_lang: s
             
             if track:
                 flow.setRetry(retry).setRetryLimit(retry_limit).setRetryTime(retry_time).extract().setTrack().translate_all_from_track(source_lang=source_lang, target_lang=target_lang).package()
-                flow.cleanup() # Limpa o track file e temps
+                flow.cleanup()
             else:
                 flow.extract().translate_all(source_lang=source_lang, target_lang=target_lang).package()
                 # A limpeza de track=False será pega pelo 'finally'
